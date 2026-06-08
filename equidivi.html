@@ -1,0 +1,416 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>EDO Bass Staff + ABC — VexFlow + abcjs</title>
+<style>
+  :root{--bg:#07131a;--card:#081822;--text:#e8f6ff;--muted:#8fb0c7;--accent:#6be0b3}
+  body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;background:var(--bg);color:var(--text)}
+  .app{max-width:980px;margin:16px auto;padding:14px}
+  header{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+  h1{margin:0;font-size:18px}
+  .controls{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
+  select,input,button,textarea{background:var(--card);border:1px solid rgba(255,255,255,0.04);color:var(--text);padding:8px;border-radius:8px}
+  button{cursor:pointer}
+  .row{display:flex;gap:12px;margin-top:12px;flex-wrap:wrap}
+  .card{background:linear-gradient(180deg,rgba(255,255,255,0.02),transparent);padding:12px;border-radius:12px;flex:1;min-width:260px}
+  #vf{min-height:160px}
+  .small{font-size:13px;color:var(--muted)}
+  .fav-list{margin-top:8px;max-height:160px;overflow:auto}
+  .fav-item{display:flex;justify-content:space-between;gap:8px;padding:6px;border-radius:8px;background:rgba(255,255,255,0.01);margin-bottom:6px}
+  textarea{width:100%;height:96px;color:var(--text);resize:vertical}
+  footer{margin-top:14px;color:var(--muted);font-size:13px}
+  @media (max-width:640px){ .row{flex-direction:column} }
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <h1>Equal-Division Bass Staff + ABC</h1>
+    <div class="small">VexFlow (engraved bass clef) + ABC (abcjs). Time signature included.</div>
+  </header>
+
+  <div class="controls">
+    <label>Division<select id="division"><option>3</option><option>4</option><option>5</option><option>6</option><option>8</option><option>12</option></select></label>
+    <label>Root<select id="root"></select></label>
+    <label>Time<select id="time"><option>4/4</option><option>3/4</option><option>5/4</option><option>6/8</option></select></label>
+    <label>Length<select id="length"><option value="1">One cycle</option><option value="2">Repeat ×2</option><option value="4">Repeat ×4</option></select></label>
+    <label>BPM<input id="bpm" type="number" value="80" min="30" max="220" style="width:84px"></label>
+    <button id="randomize">Randomize</button>
+    <button id="play">Play</button>
+    <button id="save">Save</button>
+  </div>
+
+  <div class="row">
+    <div class="card" style="flex:1.6">
+      <div class="small">Engraved staff (bass clef)</div>
+      <div id="vf"></div>
+      <div class="small" id="patternText" style="margin-top:8px"></div>
+    </div>
+
+    <div class="card" style="min-width:320px;max-width:360px">
+      <div class="small">ABC notation + controls</div>
+      <textarea id="abc" readonly></textarea>
+      <div style="display:flex;gap:8px;margin-top:8px">
+        <button id="copyABC">Copy ABC</button>
+        <button id="export">Export JSON</button>
+        <button id="importBtn">Import</button>
+        <input id="importFile" type="file" accept="application/json" style="display:none">
+      </div>
+      <div class="small" style="margin-top:8px">Favorites</div>
+      <div id="favList" class="fav-list"></div>
+    </div>
+  </div>
+  <footer class="small">Uses CDN: VexFlow & abcjs. If offline use is required, replace scripts with local files.</footer>
+</div>
+
+<!-- VexFlow 5 and abcjs CDN (browser-friendly bundles). If blocked, download and serve locally. -->
+<script src="https://cdn.jsdelivr.net/npm/vexflow@4.2.2/build/cjs/vexflow.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/abcjs@6.4.0/dist/abcjs-basic-min.js"></script>
+
+<script>
+/* --- data & utils --- */
+const NOTE_NAMES = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"];
+const rootSel = document.getElementById('root');
+const divisionSel = document.getElementById('division');
+const timeSel = document.getElementById('time');
+const lengthSel = document.getElementById('length');
+const vfDiv = document.getElementById('vf');
+const patternText = document.getElementById('patternText');
+const abcArea = document.getElementById('abc');
+const favList = document.getElementById('favList');
+const bpmInput = document.getElementById('bpm');
+
+function populateRoots(){ rootSel.innerHTML = NOTE_NAMES.map((n,i)=>`<option value="${i}">${n}</option>`).join(''); }
+populateRoots();
+
+function mod(n,m){ return ((n % m)+m)%m; }
+function generateCycle(division, rootIndex){
+  const step = 12 / division;
+  const pitches = [];
+  for(let k=0;k<division;k++) pitches.push(mod(Math.round(rootIndex + k*step),12));
+  return pitches;
+}
+
+/* --- map pitch classes to specific octaves for bass clef readability
+   We'll generate ABC and VexFlow notes using chosen octave mapping:
+   Place first occurrence near C3..E3 range and keep subsequent notes as register-nearest to previous for smooth layout.
+*/
+function pitchClassToNoteNames(pitches){
+  // choose starting midi for first pitch: find midi in range 36..52 (C2..E3) matching pc closest to middle (48)
+  const low=36, high=52, base=48;
+  const seq=[];
+  let prevMidi=null;
+  for(let i=0;i<pitches.length;i++){
+    const pc=pitches[i];
+    const cands=[];
+    for(let m=low;m<=high;m++){
+      if(m%12===pc) cands.push(m);
+    }
+    if(cands.length===0){
+      // fallback compute first >= low then mod
+      let m=low; while(m%12!==pc) m++; cands.push(m);
+    }
+    let chosen;
+    if(prevMidi===null) cands.sort((a,b)=>Math.abs(a-base)-Math.abs(b-base)), chosen=cands[0];
+    else cands.sort((a,b)=>Math.abs(a-prevMidi)-Math.abs(b-prevMidi)), chosen=cands[0];
+    prevMidi=chosen;
+    // convert midi to ABC note (C=0 -> MIDI 0). ABC uses octave markers with letters; we'll convert to scientific then ABC.
+    seq.push(chosen);
+  }
+  return seq;
+}
+
+function midiToScientific(m){
+  const note = NOTE_NAMES[m%12];
+  const octave = Math.floor(m/12)-1; // MIDI 60 -> C4 -> octave 4
+  return note+octave;
+}
+
+/* ABC conversion helper: translate midi to abc pitch with octave marks
+   Use simple convention: middle C = C (octave 4 in scientific) -> ABC lowercase/uppercase rules:
+   We'll produce ABC with octave numbers using extended syntax [K:C] and specifying written pitches with octave marks.
+*/
+function midiToABC(m){
+  // We'll produce ABC using pitch letter + octave number (abcjs accepts "C''" style but simpler: use scientific with octave mark is supported: e.g., C3? abcjs supports numeric octave via =)
+  // Simpler: produce note names with comma/apostrophe notation relative to middle C (C is middle octave in abcjs? abcjs expects lowercase for middle octave).
+  // We'll use abcjs parse-friendly format using pitch letters and octave markers: uppercase for octave below middle (C,), lowercase for middle and above.
+  // Implement mapping: MIDI 60 = C4 -> in abcjs that's "c'", but this mapping is fiddly. Instead we'll generate ABC with explicit note lengths and use abcjs's "K:C" and numeric pitch? To keep robust, use abcjs built-in parser from scientific pitch using [e.g., C/4]? abcjs does not parse scientific by default.
+  // Simpler reliable approach: convert midi to note name + octave number and then to abc's "note with octave" using the following:
+  // Use midi->pitch class + octave relative to C4: abc middle c = C (lowercase c?) To avoid pitfalls, we'll delegate playback to abcjs by constructing an ABC tune using standard ABC pitch notation computed by helper below.
+  const pc = m%12;
+  const octave = Math.floor(m/12)-4; // relative to middle C octave
+  // abc notation: c, C, c', c'' etc. We'll map: octave -1 -> ,, , 0 -> C (uppercase), 1 -> c (lowercase), >1 -> c' etc.
+  const letterMap = ["C","^C","D","^D","E","F","^F","G","^G","A","^A","B"]; // use sharps as ^X
+  let letter = letterMap[pc];
+  // normalize letter base and accidental
+  let accidental='';
+  if(letter.startsWith('^')){ accidental='^'; letter=letter.slice(1); }
+  // Determine base: we'll treat octaveRelative where 0 = uppercase middle-lower octave (C3?), this is heuristic but fine for small ranges
+  // Compute ABC octave markers:
+  // We'll compute abc pitch using lowercase for octave >=0 and uppercase for octave <0 per ABC standard (lowercase c is octave above middle C).
+  // More simply: compute ABC string via scientific->abc using this mapping:
+  const octaveFromC4 = Math.floor(m/12)-4; // 0 = C4..B4
+  // Build base letter
+  let abcLetter;
+  if(octaveFromC4 < 0){
+    // uppercase and add commas
+    abcLetter = letter.toUpperCase() + ','.repeat(Math.abs(octaveFromC4));
+  } else {
+    // lowercase and add apostrophes for octaves above first
+    abcLetter = letter.toLowerCase() + "'".repeat(Math.max(0, octaveFromC4-1));
+  }
+  return accidental + abcLetter;
+}
+
+/* --- VexFlow rendering --- */
+// Converts a MIDI number to a VexFlow key string like "c#/3" and optional accidental like "#"
+function midiToVFKey(m){
+  const SHARP_NAMES = ["c","c#","d","d#","e","f","f#","g","g#","a","a#","b"];
+  const pc = m % 12;
+  const oct = Math.floor(m / 12) - 1; // MIDI 60 = C4 = octave 4 (MIDI standard: C-1=0)
+  const name = SHARP_NAMES[pc];
+  const hasSharp = name.includes('#');
+  return { key: name + '/' + oct, accidental: hasSharp ? '#' : null };
+}
+
+function renderVexFlow(midiSeq, timeSignature){
+  vfDiv.innerHTML = '';
+
+  // Parse time signature
+  const [tsNum, tsDen] = timeSignature.split('/').map(Number);
+
+  // Use the correct VexFlow namespace (v4+ exposes Vex.Flow; v5 may also expose VexFlow directly)
+  const VF = (typeof Vex !== 'undefined' && Vex.Flow) ? Vex.Flow
+           : (typeof VexFlow !== 'undefined') ? VexFlow
+           : null;
+  if(!VF){ vfDiv.textContent = 'VexFlow not loaded.'; return; }
+
+  const NOTE_PER_BEAT = 4 / tsDen;          // quarter-note units per beat
+  const BEATS_PER_MEASURE = tsNum;
+  const QUARTERS_PER_MEASURE = BEATS_PER_MEASURE * NOTE_PER_BEAT;
+  // Use the denominator's note duration for each note (e.g. 8th note in 6/8)
+  const noteDur = tsDen === 8 ? '8' : 'q';
+  const restDur = tsDen === 8 ? '8r' : 'qr';
+  // Notes per measure = numerator (each note = one beat-unit)
+  const NOTES_PER_MEASURE = tsNum;
+
+  // Split midiSeq into measures
+  const measures = [];
+  for(let i = 0; i < midiSeq.length; i += NOTES_PER_MEASURE){
+    measures.push(midiSeq.slice(i, i + NOTES_PER_MEASURE));
+  }
+
+  // Layout constants
+  const CLEF_W    = 60;
+  const TIMESIG_W = 36;
+  const NOTE_W    = 64;
+  const MARGIN    = 16;
+  const HEIGHT    = 180;
+  const STAVE_Y   = 40;
+
+  // Measure widths
+  const measureWidths = measures.map(m => Math.max(NOTE_W * m.length + 20, 80));
+  const totalWidth = CLEF_W + TIMESIG_W + measureWidths.reduce((a,b)=>a+b,0) + MARGIN*2;
+
+  // Create renderer
+  const renderer = new VF.Renderer(vfDiv, VF.Renderer.Backends.SVG);
+  renderer.resize(totalWidth, HEIGHT);
+  const ctx = renderer.getContext();
+
+  // Build measures as staves
+  let xCursor = MARGIN;
+  measures.forEach((measureMidi, mi) => {
+    const mWidth = (mi === 0 ? CLEF_W + TIMESIG_W : 0) + measureWidths[mi];
+    const stave = new VF.Stave(xCursor, STAVE_Y, mWidth);
+    if(mi === 0){
+      stave.addClef('bass').addTimeSignature(timeSignature);
+    }
+    stave.setContext(ctx).draw();
+
+    // Build StaveNote objects for this measure
+    const staveNotes = measureMidi.map(midi => {
+      const {key, accidental} = midiToVFKey(midi);
+      const sn = new VF.StaveNote({
+        clef: 'bass',
+        keys: [key],
+        duration: noteDur
+      });
+      if(accidental){
+        sn.addModifier(new VF.Accidental(accidental), 0);
+      }
+      return sn;
+    });
+
+    // Pad with rests if measure is short (e.g. last measure)
+    const restCount = NOTES_PER_MEASURE - staveNotes.length;
+    for(let r = 0; r < restCount; r++){
+      staveNotes.push(new VF.StaveNote({clef:'bass', keys:['d/3'], duration: restDur}));
+    }
+
+    // Create a voice in strict mode
+    const voice = new VF.Voice({num_beats: tsNum, beat_value: tsDen});
+    voice.addTickables(staveNotes);
+
+    // Format and draw
+    new VF.Formatter().joinVoices([voice]).format([voice], measureWidths[mi] - 20);
+    voice.draw(ctx, stave);
+
+    xCursor += mWidth;
+  });
+}
+
+/* --- ABC generation & playback --- */
+function generateABC(pitchesMidi, division, root, timeSignature, lengthCount, bpm){
+  // Build header
+  const meter = timeSignature;
+  const L = '1/4'; // default unit note length quarter (we'll express notes as quarter or shorter)
+  const header = [
+    'X:1',
+    `T:EDO ${division} cycle`,
+    `M:${meter}`,
+    `L:${L}`,
+    `Q:1/4=${bpm}`,
+    'K:C' // key irrelevant, cycles are chromatic; use C to avoid accidentals mapping issues
+  ].join('\n');
+  // body: convert midi to abc tokens of quarter notes (with accidentals)
+  const tokens = pitchesMidi.map(m=>midiToABC(m)+' ');
+  // group into measures matching meter — naive grouping based on quarter note units
+  // compute beats per measure from meter e.g., "6/8" => beats=6 with eighth unit; we'll simplify: split by beat count of numerator
+  const num = parseInt(meter.split('/')[0],10);
+  const den = parseInt(meter.split('/')[1],10);
+  const beatUnit = 4/den; // number of quarter-note units per beat
+  const quartersPerMeasure = num * beatUnit;
+  // each token is a quarter -> so group tokens by quartersPerMeasure
+  const bodyParts=[];
+  for(let i=0;i<pitchesMidi.length;i+=quartersPerMeasure){
+    const measure = tokens.slice(i,i+quartersPerMeasure).join('').trim();
+    bodyParts.push(measure || 'z');
+  }
+  const body = bodyParts.join(' | ');
+  return header + '\n' + body + '\n';
+}
+
+/* --- Favorites --- */
+const STORE_KEY = 'edb_vf_abc_favs_v1';
+function loadFavs(){ try{return JSON.parse(localStorage.getItem(STORE_KEY)||'[]')}catch(e){return []} }
+function saveFavs(list){ localStorage.setItem(STORE_KEY, JSON.stringify(list)); renderFavs(); }
+function renderFavs(){
+  const list = loadFavs();
+  favList.innerHTML='';
+  if(list.length===0){ favList.innerHTML='<div class="small">No favorites.</div>'; return; }
+  list.forEach((f,idx)=>{
+    const div=document.createElement('div'); div.className='fav-item';
+    const left=document.createElement('div'); left.innerHTML=`<div><strong>${f.name}</strong></div><div class="small">${f.division}‑EDO · ${NOTE_NAMES[f.root]} · ${f.time}</div>`;
+    const actions=document.createElement('div');
+    const recall=document.createElement('button'); recall.textContent='Recall';
+    recall.onclick=()=>{ divisionSel.value=f.division; rootSel.value=f.root; timeSel.value=f.time; lengthSel.value=f.length; bpmInput.value=f.bpm; generateAndRender(); };
+    const del=document.createElement('button'); del.textContent='Delete';
+    del.onclick=()=>{ const arr=loadFavs(); arr.splice(idx,1); saveFavs(arr); };
+    actions.appendChild(recall); actions.appendChild(del);
+    div.appendChild(left); div.appendChild(actions);
+    favList.appendChild(div);
+  });
+}
+renderFavs();
+
+/* --- core generation flow --- */
+let currentState=null;
+function generateAndRender(){
+  const division = parseInt(divisionSel.value,10);
+  const root = parseInt(rootSel.value,10);
+  const len = parseInt(lengthSel.value,10);
+  const timeSignature = timeSel.value;
+  const bpm = Number(bpmInput.value)||80;
+  const basePitches = generateCycle(division, root);
+  // Fill len measures by rotating through the cycle continuously (e.g. CEGC|EGCE|...)
+  const [tsNum, tsDen] = timeSignature.split('/').map(Number);
+  const notesPerMeasure = tsNum; // one note per beat-unit
+  const totalNotes = len * notesPerMeasure;
+  const pitchSeq = Array.from({length: totalNotes}, (_, i) => basePitches[i % basePitches.length]);
+  const midiSeq = pitchClassToNoteNames(pitchSeq);
+  // render
+  try{ renderVexFlow(midiSeq, timeSignature); } catch(e){ vfDiv.textContent='Rendering error (VexFlow): '+e.message; }
+  // ABC
+  const abcText = generateABC(midiSeq, division, root, timeSignature, len, bpm);
+  abcArea.value = abcText;
+  patternText.textContent = `Pitches: ${basePitches.map(p=>NOTE_NAMES[p]).join(' · ')} — division ${division}`;
+  currentState={division,root,len,time:timeSignature,bpm,midiSeq,basePitches,abc:abcText};
+  return currentState;
+}
+
+/* --- playback via WebAudio (abcjs-basic has no synth module) --- */
+let _audioCtx = null;
+function getAudioCtx(){
+  if(!_audioCtx) _audioCtx = new (window.AudioContext||window.webkitAudioContext)();
+  return _audioCtx;
+}
+
+function playABC(){
+  if(!currentState) generateAndRender();
+  const ctx = getAudioCtx();
+  // resume() is required after a user gesture on Chrome/Safari
+  ctx.resume().then(() => {
+    const seq = currentState.midiSeq;
+    const bpm = currentState.bpm || 80;
+    const period = 60 / bpm;
+    const gate   = period * 0.85;
+    const t0 = ctx.currentTime + 0.05;
+    seq.forEach((midi, i) => {
+      const freq = 440 * Math.pow(2, (midi - 69) / 12);
+      const osc  = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'triangle';
+      osc.frequency.value = freq;
+      gain.gain.setValueAtTime(0, t0 + i * period);
+      gain.gain.linearRampToValueAtTime(0.18, t0 + i * period + 0.01);
+      gain.gain.setValueAtTime(0.18, t0 + i * period + gate - 0.02);
+      gain.gain.linearRampToValueAtTime(0, t0 + i * period + gate);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(t0 + i * period);
+      osc.stop(t0 + i * period + gate);
+    });
+  });
+}
+
+/* --- UI handlers --- */
+document.getElementById('randomize').addEventListener('click', ()=>{
+  divisionSel.value=[3,4,5,6,8,12][Math.floor(Math.random()*6)];
+  rootSel.value = Math.floor(Math.random()*12);
+  lengthSel.value = [1,2,4][Math.floor(Math.random()*3)];
+  generateAndRender();
+});
+document.getElementById('play').addEventListener('click', ()=>{ playABC(); });
+document.getElementById('save').addEventListener('click', ()=>{
+  const st = currentState || generateAndRender();
+  const name = prompt('Favorite name', `${st.division}‑EDO · ${NOTE_NAMES[st.root]} · ${st.time}`) || `${st.division}‑EDO`;
+  const list = loadFavs();
+  list.push({name,division:st.division,root:st.root,length:st.len||st.length,time:st.time,bpm:st.bpm,abc:st.abc,created:Date.now()});
+  saveFavs(list);
+});
+document.getElementById('copyABC').addEventListener('click', ()=>{ abcArea.select(); document.execCommand('copy'); alert('ABC copied'); });
+document.getElementById('export').addEventListener('click', ()=>{
+  const data = JSON.stringify(loadFavs(),null,2);
+  const blob = new Blob([data],{type:'application/json'}); const url=URL.createObjectURL(blob);
+  const a=document.createElement('a'); a.href=url; a.download='edb-vf-abc-favs.json'; a.click(); URL.revokeObjectURL(url);
+});
+document.getElementById('importBtn').addEventListener('click', ()=>document.getElementById('importFile').click());
+document.getElementById('importFile').addEventListener('change', async (e)=>{
+  const f=e.target.files[0]; if(!f) return; try{ const txt=await f.text(); const json=JSON.parse(txt); if(!Array.isArray(json)) throw new Error('Invalid'); saveFavs(json); alert('Imported'); }catch(err){alert('Import failed: '+err.message);}
+});
+divisionSel.addEventListener('change', generateAndRender);
+rootSel.addEventListener('change', generateAndRender);
+timeSel.addEventListener('change', generateAndRender);
+lengthSel.addEventListener('change', generateAndRender);
+bpmInput.addEventListener('change', generateAndRender);
+
+window.addEventListener('load', ()=>{ generateAndRender(); renderFavs(); });
+
+</script>
+
+<!-- optional hidden abc render target used by abcjs synth -->
+<div id="abc-play" style="display:none"></div>
+</body>
+</html>
