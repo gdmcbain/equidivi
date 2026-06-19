@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>EDO Bass Staff + ABC — VexFlow + abcjs</title>
+<title>Interval-Cycle Bass Staff + ABC — VexFlow + abcjs</title>
 <style>
   :root{--bg:#07131a;--card:#081822;--text:#e8f6ff;--muted:#8fb0c7;--accent:#6be0b3}
   body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;background:var(--bg);color:var(--text)}
@@ -27,15 +27,15 @@
 <body>
 <div class="app">
   <header>
-    <h1>Equal-Division Bass Staff + ABC</h1>
+    <h1>Interval-Cycle Bass Staff + ABC</h1>
     <div class="small">VexFlow (engraved bass clef) + ABC (abcjs). Time signature included.</div>
   </header>
 
   <div class="controls">
-    <label>Division<select id="division"><option>3</option><option>4</option><option>5</option><option>6</option><option>8</option><option>12</option></select></label>
+    <label>Interval (semitones)<select id="division"><option>0</option><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option><option>6</option><option>7</option><option>8</option><option>9</option><option>10</option><option>11</option></select></label>
     <label>Root<select id="root"></select></label>
     <label>Time<select id="time"><option>4/4</option><option>3/4</option><option>5/4</option><option>6/8</option></select></label>
-    <label>Length<select id="length"><option value="1">One cycle</option><option value="2">Repeat ×2</option><option value="4">Repeat ×4</option></select></label>
+    <label><input type="checkbox" id="repeat"/> Repeat indefinitely</label>
     <label>BPM<input id="bpm" type="number" value="80" min="30" max="220" style="width:84px"></label>
     <button id="randomize">Randomize</button>
     <button id="play">Play</button>
@@ -75,7 +75,7 @@ const NOTE_NAMES = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"];
 const rootSel = document.getElementById('root');
 const divisionSel = document.getElementById('division');
 const timeSel = document.getElementById('time');
-const lengthSel = document.getElementById('length');
+const repeatChk = document.getElementById('repeat');
 const vfDiv = document.getElementById('vf');
 const patternText = document.getElementById('patternText');
 const abcArea = document.getElementById('abc');
@@ -86,10 +86,18 @@ function populateRoots(){ rootSel.innerHTML = NOTE_NAMES.map((n,i)=>`<option val
 populateRoots();
 
 function mod(n,m){ return ((n % m)+m)%m; }
-function generateCycle(division, rootIndex){
-  const step = 12 / division;
+function gcd(a,b){ return b===0 ? a : gcd(b, a % b); }
+function generateCycle(stepSemitones, rootIndex){
+  // Walk by a fixed integer interval (in semitones) mod 12, starting at the root,
+  // and continue until the root is returned to. No rounding, no approximation --
+  // the cycle length is 12/gcd(stepSemitones,12).
+  const step = mod(stepSemitones, 12);
   const pitches = [];
-  for(let k=0;k<division;k++) pitches.push(mod(Math.round(rootIndex + k*step),12));
+  let pc = mod(rootIndex, 12);
+  do {
+    pitches.push(pc);
+    pc = mod(pc + step, 12);
+  } while(pc !== mod(rootIndex, 12));
   return pitches;
 }
 
@@ -175,7 +183,7 @@ function midiToVFKey(m){
   return { key: name + '/' + oct, accidental: hasSharp ? '#' : null };
 }
 
-function renderVexFlow(midiSeq, timeSignature){
+function renderVexFlow(midiSeq, timeSignature, repeat){
   vfDiv.innerHTML = '';
 
   // Parse time signature
@@ -207,8 +215,8 @@ function renderVexFlow(midiSeq, timeSignature){
   const TIMESIG_W = 36;
   const NOTE_W    = 64;
   const MARGIN    = 16;
-  const HEIGHT    = 180;
-  const STAVE_Y   = 40;
+  const HEIGHT    = repeat ? 210 : 180; // a little extra headroom for the "ad lib." text
+  const STAVE_Y   = repeat ? 56 : 40;
 
   // Measure widths
   const measureWidths = measures.map(m => Math.max(NOTE_W * m.length + 20, 80));
@@ -221,13 +229,21 @@ function renderVexFlow(midiSeq, timeSignature){
 
   // Build measures as staves
   let xCursor = MARGIN;
+  let lastStave = null;
   measures.forEach((measureMidi, mi) => {
-    const mWidth = (mi === 0 ? CLEF_W + TIMESIG_W : 0) + measureWidths[mi];
+    const isFirst = mi === 0;
+    const isLast  = mi === measures.length - 1;
+    const mWidth = (isFirst ? CLEF_W + TIMESIG_W : 0) + measureWidths[mi];
     const stave = new VF.Stave(xCursor, STAVE_Y, mWidth);
-    if(mi === 0){
+    if(isFirst){
       stave.addClef('bass').addTimeSignature(timeSignature);
+      if(repeat) stave.setBegBarType(VF.Barline.type.REPEAT_BEGIN);
+    }
+    if(isLast && repeat){
+      stave.setEndBarType(VF.Barline.type.REPEAT_END);
     }
     stave.setContext(ctx).draw();
+    if(isLast) lastStave = stave;
 
     // Build StaveNote objects for this measure
     const staveNotes = measureMidi.map(midi => {
@@ -259,16 +275,26 @@ function renderVexFlow(midiSeq, timeSignature){
 
     xCursor += mWidth;
   });
+
+  // "ad lib." annotation above the final repeat barline -- the conventional way
+  // to mark an indefinite repeat (no notation symbol exists for "loop forever";
+  // performers vamp the repeated section until cued to stop).
+  if(repeat && lastStave){
+    ctx.save();
+    ctx.setFont('Georgia, serif', 13, 'italic');
+    ctx.fillText('ad lib.', lastStave.getX() + lastStave.getWidth() - 56, STAVE_Y - 14);
+    ctx.restore();
+  }
 }
 
 /* --- ABC generation & playback --- */
-function generateABC(pitchesMidi, division, root, timeSignature, lengthCount, bpm){
+function generateABC(pitchesMidi, intervalSemitones, root, timeSignature, repeat, bpm){
   // Build header
   const meter = timeSignature;
   const L = '1/4'; // default unit note length quarter (we'll express notes as quarter or shorter)
   const header = [
     'X:1',
-    `T:EDO ${division} cycle`,
+    `T:Step-${intervalSemitones} cycle${repeat ? ' (repeat indefinitely)' : ''}`,
     `M:${meter}`,
     `L:${L}`,
     `Q:1/4=${bpm}`,
@@ -288,7 +314,7 @@ function generateABC(pitchesMidi, division, root, timeSignature, lengthCount, bp
     const measure = tokens.slice(i,i+quartersPerMeasure).join('').trim();
     bodyParts.push(measure || 'z');
   }
-  const body = bodyParts.join(' | ');
+  const body = (repeat ? '|: "^ad lib." ' : '') + bodyParts.join(' | ') + (repeat ? ' :|' : '');
   return header + '\n' + body + '\n';
 }
 
@@ -302,10 +328,10 @@ function renderFavs(){
   if(list.length===0){ favList.innerHTML='<div class="small">No favorites.</div>'; return; }
   list.forEach((f,idx)=>{
     const div=document.createElement('div'); div.className='fav-item';
-    const left=document.createElement('div'); left.innerHTML=`<div><strong>${f.name}</strong></div><div class="small">${f.division}‑EDO · ${NOTE_NAMES[f.root]} · ${f.time}</div>`;
+    const left=document.createElement('div'); left.innerHTML=`<div><strong>${f.name}</strong></div><div class="small">step ${f.division} · ${NOTE_NAMES[f.root]} · ${f.time}</div>`;
     const actions=document.createElement('div');
     const recall=document.createElement('button'); recall.textContent='Recall';
-    recall.onclick=()=>{ divisionSel.value=f.division; rootSel.value=f.root; timeSel.value=f.time; lengthSel.value=f.length; bpmInput.value=f.bpm; generateAndRender(); };
+    recall.onclick=()=>{ divisionSel.value=f.division; rootSel.value=f.root; timeSel.value=f.time; repeatChk.checked=!!f.repeat; bpmInput.value=f.bpm; generateAndRender(); };
     const del=document.createElement('button'); del.textContent='Delete';
     del.onclick=()=>{ const arr=loadFavs(); arr.splice(idx,1); saveFavs(arr); };
     actions.appendChild(recall); actions.appendChild(del);
@@ -318,25 +344,28 @@ renderFavs();
 /* --- core generation flow --- */
 let currentState=null;
 function generateAndRender(){
-  const division = parseInt(divisionSel.value,10);
+  const interval = parseInt(divisionSel.value,10);
   const root = parseInt(rootSel.value,10);
-  const len = parseInt(lengthSel.value,10);
+  const repeat = repeatChk.checked;
   const timeSignature = timeSel.value;
   const bpm = Number(bpmInput.value)||80;
-  const basePitches = generateCycle(division, root);
-  // Fill len measures by rotating through the cycle continuously (e.g. CEGC|EGCE|...)
+  const basePitches = generateCycle(interval, root);
   const [tsNum, tsDen] = timeSignature.split('/').map(Number);
   const notesPerMeasure = tsNum; // one note per beat-unit
-  const totalNotes = len * notesPerMeasure;
+  // Number of measures needed for the root to recur on beat 1 of a bar:
+  // smallest M such that M*notesPerMeasure is a multiple of the cycle length.
+  const cycleLen = basePitches.length;
+  const measures = cycleLen / gcd(cycleLen, notesPerMeasure);
+  const totalNotes = measures * notesPerMeasure;
   const pitchSeq = Array.from({length: totalNotes}, (_, i) => basePitches[i % basePitches.length]);
   const midiSeq = pitchClassToNoteNames(pitchSeq);
   // render
-  try{ renderVexFlow(midiSeq, timeSignature); } catch(e){ vfDiv.textContent='Rendering error (VexFlow): '+e.message; }
+  try{ renderVexFlow(midiSeq, timeSignature, repeat); } catch(e){ vfDiv.textContent='Rendering error (VexFlow): '+e.message; }
   // ABC
-  const abcText = generateABC(midiSeq, division, root, timeSignature, len, bpm);
+  const abcText = generateABC(midiSeq, interval, root, timeSignature, repeat, bpm);
   abcArea.value = abcText;
-  patternText.textContent = `Pitches: ${basePitches.map(p=>NOTE_NAMES[p]).join(' · ')} — division ${division}`;
-  currentState={division,root,len,time:timeSignature,bpm,midiSeq,basePitches,abc:abcText};
+  patternText.textContent = `Pitches: ${basePitches.map(p=>NOTE_NAMES[p]).join(' · ')} — step ${interval} semitone${interval===1?'':'s'}, cycle length ${cycleLen}, ${measures} measure${measures===1?'':'s'} to realign on beat 1`;
+  currentState={division:interval,root,repeat,time:timeSignature,bpm,midiSeq,basePitches,abc:abcText};
   return currentState;
 }
 
@@ -347,47 +376,77 @@ function getAudioCtx(){
   return _audioCtx;
 }
 
+let _playTimeoutId = null;
+let _isPlaying = false;
+
+function scheduleOneLoop(ctx, t0){
+  const seq = currentState.midiSeq;
+  const bpm = currentState.bpm || 80;
+  const period = 60 / bpm;
+  const gate   = period * 0.85;
+  seq.forEach((midi, i) => {
+    const freq = 440 * Math.pow(2, (midi - 69) / 12);
+    const osc  = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'triangle';
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(0, t0 + i * period);
+    gain.gain.linearRampToValueAtTime(0.18, t0 + i * period + 0.01);
+    gain.gain.setValueAtTime(0.18, t0 + i * period + gate - 0.02);
+    gain.gain.linearRampToValueAtTime(0, t0 + i * period + gate);
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start(t0 + i * period);
+    osc.stop(t0 + i * period + gate);
+  });
+  return seq.length * period; // duration of one loop, seconds
+}
+
+function stopABC(){
+  _isPlaying = false;
+  if(_playTimeoutId){ clearTimeout(_playTimeoutId); _playTimeoutId = null; }
+  const btn = document.getElementById('play');
+  if(btn) btn.textContent = 'Play';
+}
+
 function playABC(){
   if(!currentState) generateAndRender();
+  if(_isPlaying){ stopABC(); return; }
   const ctx = getAudioCtx();
-  // resume() is required after a user gesture on Chrome/Safari
+  const btn = document.getElementById('play');
   ctx.resume().then(() => {
-    const seq = currentState.midiSeq;
-    const bpm = currentState.bpm || 80;
-    const period = 60 / bpm;
-    const gate   = period * 0.85;
+    _isPlaying = true;
+    if(btn) btn.textContent = 'Stop';
     const t0 = ctx.currentTime + 0.05;
-    seq.forEach((midi, i) => {
-      const freq = 440 * Math.pow(2, (midi - 69) / 12);
-      const osc  = ctx.createOscillator();
-      const gain = ctx.createGain();
-      osc.type = 'triangle';
-      osc.frequency.value = freq;
-      gain.gain.setValueAtTime(0, t0 + i * period);
-      gain.gain.linearRampToValueAtTime(0.18, t0 + i * period + 0.01);
-      gain.gain.setValueAtTime(0.18, t0 + i * period + gate - 0.02);
-      gain.gain.linearRampToValueAtTime(0, t0 + i * period + gate);
-      osc.connect(gain);
-      gain.connect(ctx.destination);
-      osc.start(t0 + i * period);
-      osc.stop(t0 + i * period + gate);
-    });
+    const loopDuration = scheduleOneLoop(ctx, t0);
+    if(currentState.repeat){
+      const scheduleNext = () => {
+        if(!_isPlaying) return;
+        const nextT0 = ctx.currentTime + 0.05;
+        const dur = scheduleOneLoop(ctx, nextT0);
+        _playTimeoutId = setTimeout(scheduleNext, dur * 1000);
+      };
+      _playTimeoutId = setTimeout(scheduleNext, loopDuration * 1000);
+    } else {
+      _playTimeoutId = setTimeout(stopABC, loopDuration * 1000);
+    }
   });
 }
 
 /* --- UI handlers --- */
 document.getElementById('randomize').addEventListener('click', ()=>{
-  divisionSel.value=[3,4,5,6,8,12][Math.floor(Math.random()*6)];
+  stopABC();
+  divisionSel.value = Math.floor(Math.random()*12);
   rootSel.value = Math.floor(Math.random()*12);
-  lengthSel.value = [1,2,4][Math.floor(Math.random()*3)];
+  repeatChk.checked = Math.random() < 0.3;
   generateAndRender();
 });
 document.getElementById('play').addEventListener('click', ()=>{ playABC(); });
 document.getElementById('save').addEventListener('click', ()=>{
   const st = currentState || generateAndRender();
-  const name = prompt('Favorite name', `${st.division}‑EDO · ${NOTE_NAMES[st.root]} · ${st.time}`) || `${st.division}‑EDO`;
+  const name = prompt('Favorite name', `step ${st.division} · ${NOTE_NAMES[st.root]} · ${st.time}`) || `step ${st.division}`;
   const list = loadFavs();
-  list.push({name,division:st.division,root:st.root,length:st.len||st.length,time:st.time,bpm:st.bpm,abc:st.abc,created:Date.now()});
+  list.push({name,division:st.division,root:st.root,repeat:st.repeat,time:st.time,bpm:st.bpm,abc:st.abc,created:Date.now()});
   saveFavs(list);
 });
 document.getElementById('copyABC').addEventListener('click', ()=>{ abcArea.select(); document.execCommand('copy'); alert('ABC copied'); });
@@ -400,11 +459,11 @@ document.getElementById('importBtn').addEventListener('click', ()=>document.getE
 document.getElementById('importFile').addEventListener('change', async (e)=>{
   const f=e.target.files[0]; if(!f) return; try{ const txt=await f.text(); const json=JSON.parse(txt); if(!Array.isArray(json)) throw new Error('Invalid'); saveFavs(json); alert('Imported'); }catch(err){alert('Import failed: '+err.message);}
 });
-divisionSel.addEventListener('change', generateAndRender);
-rootSel.addEventListener('change', generateAndRender);
-timeSel.addEventListener('change', generateAndRender);
-lengthSel.addEventListener('change', generateAndRender);
-bpmInput.addEventListener('change', generateAndRender);
+divisionSel.addEventListener('change', ()=>{ stopABC(); generateAndRender(); });
+rootSel.addEventListener('change', ()=>{ stopABC(); generateAndRender(); });
+timeSel.addEventListener('change', ()=>{ stopABC(); generateAndRender(); });
+repeatChk.addEventListener('change', ()=>{ stopABC(); generateAndRender(); });
+bpmInput.addEventListener('change', ()=>{ stopABC(); generateAndRender(); });
 
 window.addEventListener('load', ()=>{ generateAndRender(); renderFavs(); });
 
